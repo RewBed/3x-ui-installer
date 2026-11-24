@@ -9,7 +9,7 @@ readonly panel_repo=https://github.com/RewBed/3x-ui.git
 readonly panel_commit=bfaf87b9889da928ae856a172642cd52d68e7609
 
 usage() {
-    printf 'Использование: sudo bash install.sh PANEL_DOMAIN TRAEFIK_DOMAIN ACME_EMAIL\n'
+    printf 'Использование: sudo bash install.sh PANEL_DOMAIN ACME_EMAIL\n'
 }
 
 die() {
@@ -33,7 +33,6 @@ install_dependencies() {
     command -v ssh >/dev/null || missing+=(openssh-client)
     command -v curl >/dev/null || missing+=(curl)
     command -v openssl >/dev/null || missing+=(openssl)
-    command -v htpasswd >/dev/null || missing+=(apache2-utils)
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
 
     if ((${#missing[@]})); then
@@ -117,8 +116,7 @@ install_docker() {
 }
 
 traefik() {
-    docker compose --env-file "$traefik_dir/.env" \
-        -f "$traefik_dir/compose.yml" -f "$traefik_dir/installer.yml" "$@"
+    docker compose --env-file "$traefik_dir/.env" -f "$traefik_dir/compose.yml" "$@"
 }
 
 panel() {
@@ -132,9 +130,7 @@ configure_stack() {
         die 'Изменился шлюз Docker-сети proxy. Проверьте сеть и адрес привязки 3x-ui.'
     fi
 
-    printf 'ACME_EMAIL=%s\nDASHBOARD_DOMAIN=%s\n' "$acme_email" "$traefik_domain" > "$traefik_dir/.env"
-    install -m 0600 "$script_dir/traefik.compose.yml" "$traefik_dir/installer.yml"
-    htpasswd -niBC 10 admin <<< "$dashboard_password" > "$traefik_dir/dashboard.htpasswd"
+    printf 'ACME_EMAIL=%s\n' "$acme_email" > "$traefik_dir/.env"
 
     cat > "$panel_dir/.env.new" <<EOF
 DOMAIN=$panel_domain
@@ -172,29 +168,22 @@ init_panel() {
 }
 
 wait_for_https() {
-    local deadline=$((SECONDS + 180)) panel_status dashboard_status
-    printf 'Ожидание HTTPS для обоих доменов, до трёх минут.\n'
+    local deadline=$((SECONDS + 180)) panel_status
+    printf 'Ожидание HTTPS для 3x-ui, до трёх минут.\n'
     while (( SECONDS < deadline )); do
         panel_status=$(curl --silent --noproxy '*' --max-time 4 --output /dev/null \
             --write-out '%{http_code}' --resolve "$panel_domain:443:127.0.0.1" "$panel_url") || panel_status=000
-        dashboard_status=$(curl --silent --noproxy '*' --max-time 4 --output /dev/null \
-            --write-out '%{http_code}' --resolve "$traefik_domain:443:127.0.0.1" "$dashboard_url") || dashboard_status=000
-        if [[ $panel_status == 200 && $dashboard_status == 401 ]]; then
-            dashboard_status=$(curl --silent --noproxy '*' --max-time 4 --output /dev/null \
-                --write-out '%{http_code}' --resolve "$traefik_domain:443:127.0.0.1" "$dashboard_url" \
-                --config - <<< "user = \"admin:$dashboard_password\"") || dashboard_status=000
-            [[ $dashboard_status == 200 ]] && return 0
-        fi
+        [[ $panel_status == 200 ]] && return 0
         sleep 3
     done
-    die "HTTPS ещё не проверен (3x-ui: $panel_status, Traefik: $dashboard_status). Проверьте DNS, TCP 80/443 и журналы Compose. Данные входа: $install_dir/credentials.txt."
+    die "HTTPS для 3x-ui ещё не проверен (код $panel_status). Проверьте DNS, TCP 80/443 и журналы Compose. Данные входа: $install_dir/credentials.txt."
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
     usage
     exit 0
 fi
-if [[ $# != 3 ]]; then
+if [[ $# != 2 ]]; then
     usage >&2
     exit 2
 fi
@@ -205,17 +194,15 @@ fi
 [[ $ID == ubuntu ]] || die 'Требуется Ubuntu.'
 
 panel_domain=${1,,}
-traefik_domain=${2,,}
-acme_email=$3
-valid_domain "$panel_domain" && valid_domain "$traefik_domain" || die 'Укажите два DNS-имени.'
-[[ $panel_domain != "$traefik_domain" ]] || die 'Домены панели и Traefik должны различаться.'
+acme_email=$2
+valid_domain "$panel_domain" || die 'Укажите DNS-имя панели 3x-ui.'
 email_pattern='^[A-Za-z0-9][A-Za-z0-9._+%-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
 [[ $acme_email =~ $email_pattern ]] || die 'Некорректный адрес электронной почты ACME.'
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 traefik_dir=$install_dir/traefik
 panel_dir=$install_dir/3x-ui
-[[ -f $script_dir/traefik.compose.yml && -f $script_dir/3x-ui.compose.yml ]] ||
+[[ -f $script_dir/3x-ui.compose.yml ]] ||
     die 'Склонируйте репозиторий установщика целиком.'
 
 exec 9>/run/lock/3x-ui-installer.lock
@@ -232,16 +219,12 @@ if [[ ! -f $install_dir/credentials.txt ]]; then
     panel_user=admin-$(openssl rand -hex 4)
     panel_password=$(openssl rand -hex 24)
     panel_path=/$(openssl rand -hex 12)/
-    dashboard_password=$(openssl rand -hex 24)
     cat > "$install_dir/credentials.new" <<EOF
 PANEL_DOMAIN=$panel_domain
-TRAEFIK_DOMAIN=$traefik_domain
 ACME_EMAIL=$acme_email
 PANEL_USER=$panel_user
 PANEL_PASSWORD=$panel_password
 PANEL_PATH=$panel_path
-TRAEFIK_USER=admin
-TRAEFIK_PASSWORD=$dashboard_password
 EOF
     mv -T -- "$install_dir/credentials.new" "$install_dir/credentials.txt"
 fi
@@ -252,14 +235,12 @@ read_setting() {
     printf '%s\n' "${line#*=}"
 }
 
-[[ $(read_setting PANEL_DOMAIN) == "$panel_domain" && $(read_setting TRAEFIK_DOMAIN) == "$traefik_domain" &&
-   $(read_setting ACME_EMAIL) == "$acme_email" ]] || die "Укажите домены и email из $install_dir/credentials.txt."
+[[ $(read_setting PANEL_DOMAIN) == "$panel_domain" && $(read_setting ACME_EMAIL) == "$acme_email" ]] ||
+    die "Укажите домен и email из $install_dir/credentials.txt."
 panel_user=$(read_setting PANEL_USER)
 panel_password=$(read_setting PANEL_PASSWORD)
 panel_path=$(read_setting PANEL_PATH)
-dashboard_password=$(read_setting TRAEFIK_PASSWORD)
 panel_url=https://$panel_domain$panel_path
-dashboard_url=https://$traefik_domain/dashboard/
 
 printf 'Загрузка конфигураций Traefik и 3x-ui.\n'
 fetch_source "$traefik_repo" "$traefik_commit" "$traefik_dir"
@@ -281,5 +262,4 @@ panel up -d
 wait_for_https
 
 printf '\n3x-ui: %s\nЛогин: %s\nПароль: %s\n' "$panel_url" "$panel_user" "$panel_password"
-printf '\nTraefik: %s\nЛогин: admin\nПароль: %s\n' "$dashboard_url" "$dashboard_password"
 printf '\nДанные входа сохранены в %s/credentials.txt (только root).\n' "$install_dir"
