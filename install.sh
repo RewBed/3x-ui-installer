@@ -3,13 +3,13 @@ set -Eeuo pipefail
 umask 077
 
 readonly install_dir=/opt/3x-ui-stack
-readonly traefik_repo=git@github.com:RewBed/default_traefik.git
+readonly traefik_repo=https://github.com/RewBed/default_traefik.git
 readonly traefik_commit=9326d23d70b4bb657c314ba067a7198208a3d736
 readonly panel_repo=https://github.com/RewBed/3x-ui.git
 readonly panel_commit=bfaf87b9889da928ae856a172642cd52d68e7609
 
 usage() {
-    printf 'Использование: sudo bash install.sh PANEL_DOMAIN ACME_EMAIL\n'
+    printf 'Использование: sudo bash install.sh DOMAIN_OR_PUBLIC_IPV4 ACME_EMAIL\n'
 }
 
 die() {
@@ -23,6 +23,14 @@ valid_domain() {
     [[ ${#domain} -le 253 && $domain =~ $pattern ]]
 }
 
+valid_ipv4() {
+    local octet='(0|[1-9][0-9]{0,2})'
+    local pattern="^$octet\.$octet\.$octet\.$octet$"
+    [[ $1 =~ $pattern ]] &&
+        (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 &&
+           BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 ))
+}
+
 apt_install() {
     DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-remove "$@"
 }
@@ -30,7 +38,6 @@ apt_install() {
 install_dependencies() {
     local missing=()
     command -v git >/dev/null || missing+=(git)
-    command -v ssh >/dev/null || missing+=(openssh-client)
     command -v curl >/dev/null || missing+=(curl)
     command -v openssl >/dev/null || missing+=(openssl)
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
@@ -43,17 +50,26 @@ install_dependencies() {
 
 fetch_source() (
     local repo=$1 commit=$2 dest=$3 staging
+    local git_options=()
     if [[ -d $dest ]]; then
         [[ $(git -C "$dest" rev-parse HEAD) == "$commit" ]] ||
             die "В $dest ожидался коммит $commit."
         exit 0
     fi
 
+    if [[ $repo == "$traefik_repo" ]]; then
+        ( : </dev/tty ) 2>/dev/null || die 'Для загрузки приватного Traefik запустите установщик в интерактивном терминале.'
+        printf 'GitHub запросит имя пользователя. В поле Password введите Personal Access Token с правом чтения RewBed/default_traefik.\n'
+        unset GIT_ASKPASS SSH_ASKPASS
+        export GIT_TERMINAL_PROMPT=1
+        git_options=(-c credential.helper= -c core.askPass=)
+    fi
+
     staging=$(mktemp -d "$install_dir/.source.XXXXXX")
     trap 'rm -rf -- "$staging"' EXIT
     git -C "$staging" init --quiet
-    git -C "$staging" fetch --quiet --depth=1 "$repo" "$commit" ||
-        die "Не удалось скачать $repo. Проверьте доступ к репозиторию и SSH-ключ Traefik."
+    git -C "$staging" "${git_options[@]}" fetch --quiet --depth=1 "$repo" "$commit" ||
+        die "Не удалось скачать $repo. Проверьте подключение и права доступа к репозиторию."
     git -C "$staging" checkout --quiet --detach "$commit"
     mv -T -- "$staging" "$dest"
 )
@@ -130,11 +146,11 @@ configure_stack() {
         die 'Изменился шлюз Docker-сети proxy. Проверьте сеть и адрес привязки 3x-ui.'
     fi
 
-    printf 'ACME_EMAIL=%s\n' "$acme_email" > "$traefik_dir/.env"
+    printf 'ACME_EMAIL=%s\nACME_IP_ADDRESS=%s\n' "$acme_email" "$acme_ip_address" > "$traefik_dir/.env"
 
     cat > "$panel_dir/.env.new" <<EOF
-DOMAIN=$panel_domain
-TRAEFIK_CERT_RESOLVER=letsencrypt
+DOMAIN=$panel_address
+TRAEFIK_CERT_RESOLVER=$cert_resolver
 PANEL_PORT=2053
 PANEL_BIND_IP=$bind_ip
 SUB_PORT=2096
@@ -172,11 +188,11 @@ wait_for_https() {
     printf 'Ожидание HTTPS для 3x-ui, до трёх минут.\n'
     while (( SECONDS < deadline )); do
         panel_status=$(curl --silent --noproxy '*' --max-time 4 --output /dev/null \
-            --write-out '%{http_code}' --resolve "$panel_domain:443:127.0.0.1" "$panel_url") || panel_status=000
+            --write-out '%{http_code}' --connect-to "$panel_address:443:127.0.0.1:443" "$panel_url") || panel_status=000
         [[ $panel_status == 200 ]] && return 0
         sleep 3
     done
-    die "HTTPS для 3x-ui ещё не проверен (код $panel_status). Проверьте DNS, TCP 80/443 и журналы Compose. Данные входа: $install_dir/credentials.txt."
+    die "HTTPS для 3x-ui ещё не проверен (код $panel_status). Проверьте адрес панели, TCP 80/443 и журналы Compose. Данные входа: $install_dir/credentials.txt."
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
@@ -193,9 +209,16 @@ fi
 . /etc/os-release
 [[ $ID == ubuntu ]] || die 'Требуется Ubuntu.'
 
-panel_domain=${1,,}
+panel_address=${1,,}
 acme_email=$2
-valid_domain "$panel_domain" || die 'Укажите DNS-имя панели 3x-ui.'
+acme_ip_address=''
+cert_resolver=letsencrypt
+if valid_ipv4 "$panel_address"; then
+    acme_ip_address=$panel_address
+    cert_resolver=letsencryptip
+else
+    valid_domain "$panel_address" || die 'Укажите DNS-имя или публичный IPv4 панели 3x-ui.'
+fi
 email_pattern='^[A-Za-z0-9][A-Za-z0-9._+%-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
 [[ $acme_email =~ $email_pattern ]] || die 'Некорректный адрес электронной почты ACME.'
 
@@ -220,7 +243,7 @@ if [[ ! -f $install_dir/credentials.txt ]]; then
     panel_password=$(openssl rand -hex 24)
     panel_path=/$(openssl rand -hex 12)/
     cat > "$install_dir/credentials.new" <<EOF
-PANEL_DOMAIN=$panel_domain
+PANEL_DOMAIN=$panel_address
 ACME_EMAIL=$acme_email
 PANEL_USER=$panel_user
 PANEL_PASSWORD=$panel_password
@@ -235,12 +258,12 @@ read_setting() {
     printf '%s\n' "${line#*=}"
 }
 
-[[ $(read_setting PANEL_DOMAIN) == "$panel_domain" && $(read_setting ACME_EMAIL) == "$acme_email" ]] ||
-    die "Укажите домен и email из $install_dir/credentials.txt."
+[[ $(read_setting PANEL_DOMAIN) == "$panel_address" && $(read_setting ACME_EMAIL) == "$acme_email" ]] ||
+    die "Укажите адрес панели и email из $install_dir/credentials.txt."
 panel_user=$(read_setting PANEL_USER)
 panel_password=$(read_setting PANEL_PASSWORD)
 panel_path=$(read_setting PANEL_PATH)
-panel_url=https://$panel_domain$panel_path
+panel_url=https://$panel_address$panel_path
 
 printf 'Загрузка конфигураций Traefik и 3x-ui.\n'
 fetch_source "$traefik_repo" "$traefik_commit" "$traefik_dir"
@@ -249,7 +272,7 @@ install_docker
 docker network inspect proxy >/dev/null 2>&1 || docker network create --driver bridge proxy
 [[ $(docker network inspect --format '{{.Driver}}' proxy) == bridge ]] || die 'Сеть proxy должна быть типа bridge.'
 bind_ip=$(docker network inspect --format '{{(index .IPAM.Config 0).Gateway}}' proxy)
-[[ $bind_ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die 'Сети proxy нужен IPv4-шлюз.'
+valid_ipv4 "$bind_ip" || die 'Сети proxy нужен IPv4-шлюз.'
 
 configure_stack "$bind_ip"
 traefik config --quiet
