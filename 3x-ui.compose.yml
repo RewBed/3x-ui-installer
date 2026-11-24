@@ -1,0 +1,4 @@
+services:
+  panel-proxy:
+    extra_hosts: !override
+      host.docker.internal: "${PANEL_BIND_IP:?Укажите PANEL_BIND_IP}"
